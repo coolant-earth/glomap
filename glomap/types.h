@@ -59,6 +59,12 @@ struct PosePriorOptions {
   // jointly influence the residual weights.
   double prior_position_scaled_loss_factor = 1.;
 
+  // Divisor applied to `prior_position_scaled_loss_factor` during the first
+  // bundle-adjustment iteration to down-weight the pose-prior influence. This
+  // was previously hard-coded; exposing it here makes the behaviour
+  // configurable via command-line.
+  double first_iter_scaled_loss_divisor = 1.0;
+
   // Settings for alignment with pose priors.
   double alignment_ransac_max_error = 0.;
 };

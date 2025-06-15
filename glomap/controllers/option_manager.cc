@@ -295,7 +295,7 @@ void OptionManager::AddPosePriorOptions() {
   AddAndRegisterDefaultOption("PosePrior.prior_position_std_z",
                               &mapper->opt_pose_prior.prior_position_std_z);
   AddAndRegisterDefaultOption(
-      "PosePrior.overwrite_priors_covariance",
+      "PosePrior.overwrite_position_priors_covariance",
       &mapper->opt_pose_prior.overwrite_position_priors_covariance);
   AddAndRegisterDefaultOption(
       "PosePrior.use_robust_loss_on_prior_position",
@@ -306,6 +306,9 @@ void OptionManager::AddPosePriorOptions() {
   AddAndRegisterDefaultOption(
       "PosePrior.prior_position_scaled_loss_factor",
       &mapper->opt_pose_prior.prior_position_scaled_loss_factor);
+  AddAndRegisterDefaultOption(
+      "PosePrior.first_iter_scaled_loss_divisor",
+      &mapper->opt_pose_prior.first_iter_scaled_loss_divisor);
   AddAndRegisterDefaultOption(
       "PosePrior.alignment_ransac_max_error",
       &mapper->opt_pose_prior.alignment_ransac_max_error);

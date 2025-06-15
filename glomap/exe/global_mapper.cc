@@ -87,20 +87,9 @@ int RunMapper(int argc, char** argv) {
   std::unordered_map<track_t, Track> tracks;
 
   colmap::Database database(database_path);
-  // ConvertDatabaseToGlomap(
-  //     database,
-  //     view_graph,
-  //     cameras,
-  //     images,
-  //     options.mapper->opt_pose_prior.use_pose_position_prior);
-  // TODO: will need to add an auto check if pose priors are in database and do loading
-   ConvertDatabaseToGlomap(
-      database,
-      view_graph,
-      cameras,
-      images,
-      true);
-
+  
+  // Update pose-prior covariance *before* loading it into the in-memory
+  // reconstruction, so that `images` will carry the correct covariance.
   if (options.mapper->opt_pose_prior.overwrite_position_priors_covariance) {
     const Eigen::Matrix3d covariance =
         Eigen::Vector3d(options.mapper->opt_pose_prior.prior_position_std_x,
@@ -115,6 +104,22 @@ int RunMapper(int argc, char** argv) {
               << ", std_z: "
               << options.mapper->opt_pose_prior.prior_position_std_z;
   }
+
+  // ConvertDatabaseToGlomap(
+  //     database,
+  //     view_graph,
+  //     cameras,
+  //     images,
+  //     options.mapper->opt_pose_prior.use_pose_position_prior);
+  // Now convert the (potentially updated) database into the Glomap data
+  // structures.
+  // TODO: will need to add an auto check if pose priors are in database and do loading
+  ConvertDatabaseToGlomap(
+      database,
+      view_graph,
+      cameras,
+      images,
+      true);
 
   if (view_graph.image_pairs.empty()) {
     LOG(ERROR) << "Can't continue without image pairs";
