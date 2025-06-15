@@ -1,6 +1,9 @@
 #include "glomap/io/colmap_converter.h"
 
 #include "glomap/math/two_view_geometry.h"
+#include <cmath>  // For trigonometric functions and M_PI
+#include <limits>
+#include <algorithm>
 
 namespace glomap {
 
@@ -179,9 +182,81 @@ void ConvertColmapPoints3DToGlomapTracks(
 void ConvertDatabaseToGlomap(const colmap::Database& database,
                              ViewGraph& view_graph,
                              std::unordered_map<camera_t, Camera>& cameras,
-                             std::unordered_map<image_t, Image>& images) {
+                             std::unordered_map<image_t, Image>& images,
+                             bool extract_pose_priors) {
   // Add the images
-  std::vector<colmap::Image> images_colmap = database.ReadAllImages();
+  const std::vector<colmap::Image> images_colmap = database.ReadAllImages();
+
+  // First pass: compute the mean / centre of all valid pose prior positions
+  colmap::GPSTransform gps_transform(colmap::GPSTransform::WGS84);
+  Eigen::Vector3d mean_prior_position = Eigen::Vector3d::Zero();
+  size_t num_valid_priors = 0;
+  // Rotation from ECEF to local ENU centred at the mean location. Will be
+  // initialised once the statistics of the first pass are available.
+  Eigen::Matrix3d R_ecef_to_enu = Eigen::Matrix3d::Identity();
+  bool enu_transform_valid = false;
+  // Variables to accumulate the bounding box of all valid prior positions (ENU coordinates)
+  double min_east = std::numeric_limits<double>::max();
+  double max_east = std::numeric_limits<double>::lowest();
+  double min_north = std::numeric_limits<double>::max();
+  double max_north = std::numeric_limits<double>::lowest();
+  bool have_prior_area = false;
+  if (extract_pose_priors) {
+    for (const auto& image : images_colmap) {
+      const image_t image_id = image.ImageId();
+      if (image_id == colmap::kInvalidImageId) continue;
+
+      colmap::PosePrior prior = database.ReadPosePrior(image_id);
+
+      if (!prior.IsValid()) {
+        continue;
+      }
+
+      // Transform prior position to XYZ if needed (duplicate of logic below, but
+      // lightweight compared to restructuring the entire function).
+      if (prior.coordinate_system == colmap::PosePrior::CoordinateSystem::WGS84) {
+        prior.position =
+            gps_transform.EllToXYZ(std::vector<Eigen::Vector3d>{prior.position}).front();
+      }
+
+      mean_prior_position += prior.position;
+      num_valid_priors++;
+    }
+
+    if (num_valid_priors > 0) {
+      mean_prior_position /= static_cast<double>(num_valid_priors);
+
+      // Compute the reference latitude / longitude from the mean Cartesian
+      // coordinates. These will be used to define the local ENU frame so that
+      // the Z axis coincides with the Up direction (i.e. altitude).
+      Eigen::Vector3d mean_ell =
+          gps_transform
+              .XYZToEll(std::vector<Eigen::Vector3d>{mean_prior_position})
+              .front();
+
+      const double lat0_rad = mean_ell(0) * M_PI / 180.0;
+      const double lon0_rad = mean_ell(1) * M_PI / 180.0;
+
+      const double sin_lat0 = std::sin(lat0_rad);
+      const double cos_lat0 = std::cos(lat0_rad);
+      const double sin_lon0 = std::sin(lon0_rad);
+      const double cos_lon0 = std::cos(lon0_rad);
+
+      // Rotation from ECEF to local ENU frame centred at the mean location.
+      R_ecef_to_enu << -sin_lon0, cos_lon0, 0.,
+          -sin_lat0 * cos_lon0, -sin_lat0 * sin_lon0, cos_lat0,
+          cos_lat0 * cos_lon0, cos_lat0 * sin_lon0, sin_lat0;
+
+      // Mark the ENU transform as valid for use in the subsequent pass.
+      enu_transform_valid = true;
+
+      LOG(INFO) << "Computed mean prior position from " << num_valid_priors
+                << " images: " << mean_prior_position.transpose();
+    } else {
+      mean_prior_position.setZero();
+    }
+  }
+
   image_t counter = 0;
   for (auto& image : images_colmap) {
     std::cout << "\r Loading Images " << counter + 1 << " / "
@@ -192,16 +267,66 @@ void ConvertDatabaseToGlomap(const colmap::Database& database,
     if (image_id == colmap::kInvalidImageId) continue;
     auto ite = images.insert(std::make_pair(
         image_id, Image(image_id, image.CameraId(), image.Name())));
-    const colmap::PosePrior prior = database.ReadPosePrior(image_id);
+
+    Image& inserted_image = ite.first->second;
+    if (!extract_pose_priors) {
+      continue;
+    }
+
+    colmap::PosePrior prior = database.ReadPosePrior(image_id);
     if (prior.IsValid()) {
+      // Thransform prior position to XYZ if needed.
+      if (prior.coordinate_system ==
+          colmap::PosePrior::CoordinateSystem::WGS84) {
+        prior.position =
+            gps_transform.EllToXYZ(std::vector<Eigen::Vector3d>{prior.position})
+                .front();
+        // Continue processing below.
+      } else if (prior.coordinate_system ==
+                 colmap::PosePrior::CoordinateSystem::UNDEFINED) {
+        LOG(WARNING) << "Unknown coordinate system for image " << image_id
+                     << ", assuming cartesian.";
+      }
+
+      // Convert the Cartesian position to local ENU coordinates so that the Z
+      // axis matches the altitude (Up) direction.
+      if (enu_transform_valid) {
+        prior.position = R_ecef_to_enu * (prior.position - mean_prior_position);
+        prior.coordinate_system = colmap::PosePrior::CoordinateSystem::CARTESIAN;
+      } else {
+        // Fallback: just centre the coordinates without rotation.
+        prior.position -= mean_prior_position;
+      }
+
+      // Update bounding box extents (E, N components)
+      min_east = std::min(min_east, prior.position.x());
+      max_east = std::max(max_east, prior.position.x());
+      min_north = std::min(min_north, prior.position.y());
+      max_north = std::max(max_north, prior.position.y());
+      have_prior_area = true;
+
+      // Subtract the mean prior position so that the positions are centred.
+      // LOG(INFO) << "Prior position (ENU): " << prior.position.transpose();
+
       const colmap::Rigid3d world_from_cam_prior(Eigen::Quaterniond::Identity(),
                                                  prior.position);
-      ite.first->second.cam_from_world = Rigid3d(Inverse(world_from_cam_prior));
+      inserted_image.cam_from_world = Rigid3d(Inverse(world_from_cam_prior));
+      inserted_image.pose_prior = prior;
     } else {
-      ite.first->second.cam_from_world = Rigid3d();
+      inserted_image.cam_from_world = Rigid3d();
+      inserted_image.pose_prior = std::nullopt;
     }
   }
   std::cout << std::endl;
+
+  // Compute and report approximate site area (axis-aligned bounding box)
+  if (have_prior_area) {
+    const double width_east  = max_east  - min_east;
+    const double height_north = max_north - min_north;
+    const double site_area_sqm = width_east * height_north;
+    LOG(INFO) << "Site bounding box (E,N) size: " << width_east << " m x " << height_north << " m";
+    LOG(INFO) << "Approximate site area: " << site_area_sqm << " square meters.";
+  }
 
   // Read keypoints
   for (auto& [image_id, image] : images) {

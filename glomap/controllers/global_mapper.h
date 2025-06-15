@@ -26,6 +26,9 @@ struct GlobalMapperOptions {
   // Inlier thresholds for each component
   InlierThresholdOptions inlier_thresholds;
 
+  // Options for pose prior usage.
+  PosePriorOptions opt_pose_prior;
+
   // Control the number of iterations for each component
   int num_iteration_bundle_adjustment = 3;
   int num_iteration_retriangulation = 1;
@@ -40,6 +43,11 @@ struct GlobalMapperOptions {
   bool skip_bundle_adjustment = false;
   bool skip_retriangulation = false;
   bool skip_pruning = true;
+
+  // Align reconstruction to pose position priors (if loaded) after bundle
+  // adjustment to obtain metric (meter) scale, while still keeping priors
+  // unused during optimisation when `use_pose_position_prior` is false.
+  bool transform_to_meter = false;
 };
 
 class GlobalMapper {

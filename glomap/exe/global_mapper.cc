@@ -9,6 +9,25 @@
 #include <colmap/util/timer.h>
 
 namespace glomap {
+namespace {
+void UpdateDatabasePosePriorsCovariance(colmap::Database& database,
+                                        const Eigen::Matrix3d& covariance) {
+  colmap::DatabaseTransaction database_transaction(&database);
+
+  LOG(INFO)
+      << "Setting up database pose priors with the same covariance matrix: \n"
+      << covariance << "\n";
+
+  for (const auto& image : database.ReadAllImages()) {
+    if (database.ExistsPosePrior(image.ImageId())) {
+      colmap::PosePrior prior = database.ReadPosePrior(image.ImageId());
+      prior.position_covariance = covariance;
+      database.UpdatePosePrior(image.ImageId(), prior);
+    }
+  }
+}
+}  // namespace
+
 // -------------------------------------
 // Mappers starting from COLMAP database
 // -------------------------------------
@@ -67,8 +86,40 @@ int RunMapper(int argc, char** argv) {
   std::unordered_map<image_t, Image> images;
   std::unordered_map<track_t, Track> tracks;
 
-  const colmap::Database database(database_path);
-  ConvertDatabaseToGlomap(database, view_graph, cameras, images);
+  colmap::Database database(database_path);
+  
+  // Update pose-prior covariance *before* loading it into the in-memory
+  // reconstruction, so that `images` will carry the correct covariance.
+  if (options.mapper->opt_pose_prior.overwrite_position_priors_covariance) {
+    const Eigen::Matrix3d covariance =
+        Eigen::Vector3d(options.mapper->opt_pose_prior.prior_position_std_x,
+                        options.mapper->opt_pose_prior.prior_position_std_y,
+                        options.mapper->opt_pose_prior.prior_position_std_z)
+            .cwiseAbs2()
+            .asDiagonal();
+    UpdateDatabasePosePriorsCovariance(database, covariance);
+    LOG(INFO) << "Updated database pose priors covariance with std_x: "
+              << options.mapper->opt_pose_prior.prior_position_std_x
+              << ", std_y: " << options.mapper->opt_pose_prior.prior_position_std_y
+              << ", std_z: "
+              << options.mapper->opt_pose_prior.prior_position_std_z;
+  }
+
+  // ConvertDatabaseToGlomap(
+  //     database,
+  //     view_graph,
+  //     cameras,
+  //     images,
+  //     options.mapper->opt_pose_prior.use_pose_position_prior);
+  // Now convert the (potentially updated) database into the Glomap data
+  // structures.
+  // TODO: will need to add an auto check if pose priors are in database and do loading
+  ConvertDatabaseToGlomap(
+      database,
+      view_graph,
+      cameras,
+      images,
+      true);
 
   if (view_graph.image_pairs.empty()) {
     LOG(ERROR) << "Can't continue without image pairs";

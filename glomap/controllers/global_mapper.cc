@@ -1,18 +1,47 @@
 #include "global_mapper.h"
 
+#include "glomap/estimators/bundle_adjustment.h"
 #include "glomap/io/colmap_converter.h"
 #include "glomap/processors/image_pair_inliers.h"
 #include "glomap/processors/image_undistorter.h"
 #include "glomap/processors/reconstruction_normalizer.h"
 #include "glomap/processors/reconstruction_pruning.h"
+#include "glomap/processors/reconstruction_aligner.h"
 #include "glomap/processors/relpose_filter.h"
 #include "glomap/processors/track_filter.h"
 #include "glomap/processors/view_graph_manipulation.h"
 
 #include <colmap/util/file.h>
 #include <colmap/util/timer.h>
+#include <colmap/estimators/similarity_transform.h>
+#include <colmap/geometry/sim3.h>
+
+#include <memory>
 
 namespace glomap {
+namespace {
+void RestoreTranslationToPriorPosition(
+    std::unordered_map<image_t, Image>& images) {
+  for (auto& [_, image] : images) {
+    if (!image.pose_prior) {
+      continue;
+    }
+    // t=-Rc
+    image.cam_from_world.translation =
+        -(image.cam_from_world.rotation * image.pose_prior->position);
+  }
+}
+
+PosePriorBundleAdjusterOptions ExtractPosePriorBAOptions(
+    const GlobalMapperOptions& options) {
+  PosePriorBundleAdjusterOptions pose_prior_options(
+      options.opt_pose_prior.use_robust_loss_on_prior_position,
+      options.opt_pose_prior.prior_position_loss_threshold,
+      options.opt_pose_prior.prior_position_scaled_loss_factor,
+      options.opt_pose_prior.alignment_ransac_max_error);
+  return pose_prior_options;
+}
+}  // namespace
 
 bool GlobalMapper::Solve(const colmap::Database& database,
                          ViewGraph& view_graph,
@@ -108,6 +137,8 @@ bool GlobalMapper::Solve(const colmap::Database& database,
     LOG(INFO) << num_img << " / " << images.size()
               << " images are within the connected component." << std::endl;
 
+    RestoreTranslationToPriorPosition(images);
+
     run_timer.PrintSeconds();
   }
 
@@ -144,6 +175,12 @@ bool GlobalMapper::Solve(const colmap::Database& database,
     UndistortImages(cameras, images, false);
 
     GlobalPositioner gp_engine(options_.opt_gp);
+
+    // Do not gernerate random image positions if use prior position.
+    // TODO: improve or remove this, it seems not necessary
+    // gp_engine.GetOptions().generate_random_positions =
+    //     !options_.opt_pose_prior.use_pose_position_prior;
+
     if (!gp_engine.Solve(view_graph, cameras, images, tracks)) {
       return false;
     }
@@ -170,8 +207,10 @@ bool GlobalMapper::Solve(const colmap::Database& database,
         tracks,
         options_.inlier_thresholds.max_angle_error);
 
-    // Normalize the structure
-    NormalizeReconstruction(cameras, images, tracks);
+    // Normalize the structure if do not use prior position.
+    if (!options_.opt_pose_prior.use_pose_position_prior) {
+      NormalizeReconstruction(cameras, images, tracks);
+    }
 
     run_timer.PrintSeconds();
   }
@@ -186,15 +225,74 @@ bool GlobalMapper::Solve(const colmap::Database& database,
     colmap::Timer run_timer;
     run_timer.Start();
 
-    for (int ite = 0; ite < options_.num_iteration_bundle_adjustment; ite++) {
-      BundleAdjuster ba_engine(options_.opt_ba);
+    // -------------------------------------------------------------------
+    // Record the initial Z value (camera center altitude) of every image
+    // before any bundle-adjustment takes place. We use the image centre in
+    // world coordinates, i.e. `Image::Center()`, instead of the raw
+    // translation element, because the centre is invariant to the
+    // parameterisation of the pose (t depends on R).
+    // -------------------------------------------------------------------
+    std::unordered_map<image_t, double> initial_center_zs;
+    initial_center_zs.reserve(images.size());
+    for (const auto& [img_id, img] : images) {
+      initial_center_zs[img_id] = img.Center()(2);
+    }
 
-      BundleAdjusterOptions& ba_engine_options_inner = ba_engine.GetOptions();
+    // -------------------------------------------------------------------
+    // Compute mean absolute Z error to pose priors BEFORE bundle adjustment
+    // This shows how far camera heights deviate from their priors initially.
+    // -------------------------------------------------------------------
+    double sum_abs_z_err_prior_before = 0.0;
+    size_t num_prior_z = 0;
+    for (const auto& [img_id, img] : images) {
+      if (img.pose_prior.has_value() &&
+          img.pose_prior->coordinate_system ==
+              colmap::PosePrior::CoordinateSystem::CARTESIAN) {
+        sum_abs_z_err_prior_before += std::abs(img.Center()(2) -
+                                              img.pose_prior->position(2));
+        ++num_prior_z;
+      }
+    }
+    const double mean_abs_z_err_prior_before = (num_prior_z == 0)
+                                                   ? 0.0
+                                                   : sum_abs_z_err_prior_before /
+                                                         static_cast<double>(num_prior_z);
+
+    std::cout << "Mean absolute Z error to priors BEFORE bundle adjustment: "
+              << mean_abs_z_err_prior_before << std::endl;
+    LOG(INFO) << "Mean absolute Z error to priors BEFORE bundle adjustment: "
+              << mean_abs_z_err_prior_before;
+
+    for (int ite = 0; ite < options_.num_iteration_bundle_adjustment; ite++) {
+      std::unique_ptr<BundleAdjuster> ba_engine;
+
+      if (options_.opt_pose_prior.use_pose_position_prior) {
+        PosePriorBundleAdjusterOptions opt_prior_ba =
+            ExtractPosePriorBAOptions(options_);
+        if (ite == 0) {
+          // Down-weight the pose prior influence in the first iteration using
+          // the user-specified divisor.
+          opt_prior_ba.prior_position_scaled_loss_factor =
+              opt_prior_ba.prior_position_scaled_loss_factor /
+              options_.opt_pose_prior.first_iter_scaled_loss_divisor;
+          std::cout << "ite==0: down the effect of prior_position_scaled_loss_factor by "
+                    << options_.opt_pose_prior.first_iter_scaled_loss_divisor << std::endl;
+        }
+        std::cout << "prior_position_scaled_loss_factor: "
+                  << opt_prior_ba.prior_position_scaled_loss_factor
+                  << std::endl;
+        ba_engine = std::make_unique<PosePriorBundleAdjuster>(options_.opt_ba,
+                                                              opt_prior_ba);
+      } else {
+        ba_engine = std::make_unique<BundleAdjuster>(options_.opt_ba);
+      }
+
+      BundleAdjusterOptions& ba_engine_options_inner = ba_engine->GetOptions();
 
       // Staged bundle adjustment
       // 6.1. First stage: optimize positions only
       ba_engine_options_inner.optimize_rotations = false;
-      if (!ba_engine.Solve(view_graph, cameras, images, tracks)) {
+      if (!ba_engine->Solve(view_graph, cameras, images, tracks)) {
         return false;
       }
       LOG(INFO) << "Global bundle adjustment iteration " << ite + 1 << " / "
@@ -206,7 +304,7 @@ bool GlobalMapper::Solve(const colmap::Database& database,
       ba_engine_options_inner.optimize_rotations =
           options_.opt_ba.optimize_rotations;
       if (ba_engine_options_inner.optimize_rotations &&
-          !ba_engine.Solve(view_graph, cameras, images, tracks)) {
+          !ba_engine->Solve(view_graph, cameras, images, tracks)) {
         return false;
       }
       LOG(INFO) << "Global bundle adjustment iteration " << ite + 1 << " / "
@@ -215,8 +313,10 @@ bool GlobalMapper::Solve(const colmap::Database& database,
       if (ite != options_.num_iteration_bundle_adjustment - 1)
         run_timer.PrintSeconds();
 
-      // Normalize the structure
-      NormalizeReconstruction(cameras, images, tracks);
+      // Normalize the structure if do not use prior position.
+      if (!options_.opt_pose_prior.use_pose_position_prior) {
+        NormalizeReconstruction(cameras, images, tracks);
+      }
 
       // 6.3. Filter tracks based on the estimation
       // For the filtering, in each round, the criteria for outlier is
@@ -262,6 +362,97 @@ bool GlobalMapper::Solve(const colmap::Database& database,
         tracks,
         options_.inlier_thresholds.min_triangulation_angle);
 
+    // -------------------------------------------------------------------
+    // Compute and report the mean absolute change in Z after bundle-adjustment.
+    // -------------------------------------------------------------------
+    // 1. Change relative to initial reconstruction
+    double sum_abs_z_error = 0.0;
+    for (const auto& [img_id, img] : images) {
+      const auto it = initial_center_zs.find(img_id);
+      if (it != initial_center_zs.end()) {
+        sum_abs_z_error += std::abs(img.Center()(2) - it->second);
+      }
+    }
+    const double mean_abs_z_error = images.empty()
+                                     ? 0.0
+                                     : sum_abs_z_error / static_cast<double>(images.size());
+
+    LOG(INFO) << "Mean absolute Z CHANGE after bundle adjustment: "
+              << mean_abs_z_error;
+
+    // 2. Error to priors AFTER bundle adjustment
+    double sum_abs_z_err_prior_after = 0.0;
+    for (const auto& [img_id, img] : images) {
+      if (img.pose_prior.has_value() &&
+          img.pose_prior->coordinate_system ==
+              colmap::PosePrior::CoordinateSystem::CARTESIAN) {
+        sum_abs_z_err_prior_after += std::abs(img.Center()(2) -
+                                             img.pose_prior->position(2));
+      }
+    }
+    const double mean_abs_z_err_prior_after = (num_prior_z == 0)
+                                                   ? 0.0
+                                                   : sum_abs_z_err_prior_after /
+                                                         static_cast<double>(num_prior_z);
+
+    LOG(INFO) << "Mean absolute Z error to priors AFTER bundle adjustment: "
+              << mean_abs_z_err_prior_after;
+
+    // -------------------------------------------------------------------
+    // (Optional) Align reconstruction to pose priors for evaluation only
+    // if pose priors were NOT used during optimisation. This provides an
+    // apples-to-apples Z-error measure even when the reconstruction coordinate
+    // frame differs from the prior frame.
+    // -------------------------------------------------------------------
+    if (!options_.opt_pose_prior.use_pose_position_prior && num_prior_z > 0) {
+      // Build point correspondences: reconstruction centres -> prior positions
+      std::vector<Eigen::Vector3d> src_locations;
+      std::vector<Eigen::Vector3d> tgt_locations;
+      src_locations.reserve(num_prior_z);
+      tgt_locations.reserve(num_prior_z);
+      for (const auto& [img_id, img] : images) {
+        if (img.pose_prior.has_value() &&
+            img.pose_prior->coordinate_system ==
+                colmap::PosePrior::CoordinateSystem::CARTESIAN) {
+          src_locations.emplace_back(img.Center());
+          tgt_locations.emplace_back(img.pose_prior->position);
+        }
+      }
+
+      if (!src_locations.empty()) {
+        colmap::Sim3d tform;
+        bool align_success = false;
+        const double max_error = (options_.opt_pose_prior.alignment_ransac_max_error > 0)
+                                     ? options_.opt_pose_prior.alignment_ransac_max_error
+                                     : -1.0;
+        if (max_error > 0) {
+          colmap::RANSACOptions ransac_opt;
+          ransac_opt.max_error = max_error;
+          auto report = colmap::EstimateSim3dRobust(
+              src_locations, tgt_locations, ransac_opt, tform);
+          align_success = report.success;
+        } else {
+          align_success = colmap::EstimateSim3d(src_locations, tgt_locations, tform);
+        }
+
+        if (align_success) {
+          double sum_abs_z_err_aligned = 0.0;
+          for (size_t i = 0; i < src_locations.size(); ++i) {
+            const double z_est = (tform * src_locations[i])(2);
+            const double z_true = tgt_locations[i](2);
+            sum_abs_z_err_aligned += std::abs(z_est - z_true);
+          }
+          const double mean_abs_z_err_aligned =
+              sum_abs_z_err_aligned / static_cast<double>(src_locations.size());
+
+          LOG(INFO) << "Mean absolute Z error to priors AFTER alignment (evaluation only): "
+                    << mean_abs_z_err_aligned;
+        } else {
+          LOG(WARNING) << "Could not align reconstruction to pose priors for evaluation.";
+        }
+      }
+    }
+
     run_timer.PrintSeconds();
   }
 
@@ -281,8 +472,19 @@ bool GlobalMapper::Solve(const colmap::Database& database,
       std::cout << "Running bundle adjustment ..." << std::endl;
       std::cout << "-------------------------------------" << std::endl;
       LOG(INFO) << "Bundle adjustment start" << std::endl;
-      BundleAdjuster ba_engine(options_.opt_ba);
-      if (!ba_engine.Solve(view_graph, cameras, images, tracks)) {
+
+      std::unique_ptr<BundleAdjuster> ba_engine;
+
+      if (options_.opt_pose_prior.use_pose_position_prior) {
+        PosePriorBundleAdjusterOptions pose_prior_ba_options =
+            ExtractPosePriorBAOptions(options_);
+        ba_engine = std::make_unique<PosePriorBundleAdjuster>(
+            options_.opt_ba, pose_prior_ba_options);
+      } else {
+        ba_engine = std::make_unique<BundleAdjuster>(options_.opt_ba);
+      }
+
+      if (!ba_engine->Solve(view_graph, cameras, images, tracks)) {
         return false;
       }
 
@@ -295,14 +497,18 @@ bool GlobalMapper::Solve(const colmap::Database& database,
           images,
           tracks,
           options_.inlier_thresholds.max_reprojection_error);
-      if (!ba_engine.Solve(view_graph, cameras, images, tracks)) {
+
+      // A second optimization pass to refine the solution after filtering.
+      if (!ba_engine->Solve(view_graph, cameras, images, tracks)) {
         return false;
       }
       run_timer.PrintSeconds();
     }
 
-    // Normalize the structure
-    NormalizeReconstruction(cameras, images, tracks);
+    // Normalize the structure if do not use prior position.
+    if (!options_.opt_pose_prior.use_pose_position_prior) {
+      NormalizeReconstruction(cameras, images, tracks);
+    }
 
     // Filter tracks based on the estimation
     UndistortImages(cameras, images, true);
@@ -318,6 +524,77 @@ bool GlobalMapper::Solve(const colmap::Database& database,
         images,
         tracks,
         options_.inlier_thresholds.min_triangulation_angle);
+
+    // -------------------------------------------------------------------
+    // Optionally align the reconstruction into metric scale (meters) using
+    // pose position priors, but only for evaluation / export. This is
+    // controlled by `transform_to_meter`. It is skipped if priors are not
+    // loaded or if pose priors were already used during optimisation (since
+    // the reconstruction should already be in metric scale in that case).
+    // -------------------------------------------------------------------
+    if (options_.transform_to_meter &&
+        !options_.opt_pose_prior.use_pose_position_prior) {
+      std::cout << "-------------------------------------" << std::endl;
+      std::cout << "Aligning reconstruction to meter-scale ..." << std::endl;
+      std::cout << "-------------------------------------" << std::endl;
+      std::unordered_map<image_t, colmap::PosePrior> priors;
+      for (const auto& [img_id, img] : images) {
+        if (img.pose_prior.has_value()) {
+          priors[img_id] = img.pose_prior.value();
+        }
+      }
+
+      if (!priors.empty()) {
+        LOG(INFO) << "Aligning reconstruction to pose priors for meter-scale export.";
+
+        if (AlignReconstructionToPosePositionPriors(priors, images, tracks)) {
+          LOG(INFO) << "Alignment to priors successful. Reconstruction now in meter scale.";
+        } else {
+          LOG(WARNING) << "Alignment to priors failed. Keeping original scale.";
+        }
+      } else {
+        LOG(INFO) << "No pose priors available; metric transform skipped.";
+      }
+    }
+
+    // -------------------------------------------------------------------
+    // Compute mean absolute error to pose position priors (X, Y, Z) AFTER
+    // retriangulation.
+    // -------------------------------------------------------------------
+    double sum_abs_x_err_after_retri = 0.0;
+    double sum_abs_y_err_after_retri = 0.0;
+    double sum_abs_z_err_after_retri = 0.0;
+    size_t num_prior_xyz_after_retri = 0;
+    for (const auto& [img_id, img] : images) {
+      if (img.pose_prior.has_value() &&
+          img.pose_prior->coordinate_system ==
+              colmap::PosePrior::CoordinateSystem::CARTESIAN) {
+        const Eigen::Vector3d diff = img.Center() - img.pose_prior->position;
+        sum_abs_x_err_after_retri += std::abs(diff(0));
+        sum_abs_y_err_after_retri += std::abs(diff(1));
+        sum_abs_z_err_after_retri += std::abs(diff(2));
+        ++num_prior_xyz_after_retri;
+      }
+    }
+    if (num_prior_xyz_after_retri > 0) {
+      const double mean_abs_x_err_after_retri =
+          sum_abs_x_err_after_retri /
+          static_cast<double>(num_prior_xyz_after_retri);
+      const double mean_abs_y_err_after_retri =
+          sum_abs_y_err_after_retri /
+          static_cast<double>(num_prior_xyz_after_retri);
+      const double mean_abs_z_err_after_retri =
+          sum_abs_z_err_after_retri /
+          static_cast<double>(num_prior_xyz_after_retri);
+      
+      std::cout << "-------------------------------------" << std::endl;
+      std::cout << "FINAL POSE PRIOR report errors (X, Y, Z): "<< std::endl;
+      std::cout << "-------------------------------------" << std::endl;
+      LOG(INFO) << "Mean absolute error to pose priors (X, Y, Z): "
+                << mean_abs_x_err_after_retri << ", "
+                << mean_abs_y_err_after_retri << ", "
+                << mean_abs_z_err_after_retri;
+    }
   }
 
   // 8. Reconstruction pruning

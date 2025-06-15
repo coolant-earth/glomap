@@ -10,7 +10,7 @@ namespace {
 typedef std::function<int(int, char**)> command_func_t;
 int ShowHelp(
     const std::vector<std::pair<std::string, command_func_t>>& commands) {
-  std::cout << "GLOMAP -- Global Structure-from-Motion" << std::endl
+  std::cout << "GLOMAP -- Global Structure-from-Motion -- GPS constraint enabled version (Coolant)" << std::endl
             << std::endl;
 
 #ifdef GLOMAP_CUDA_ENABLED

@@ -36,6 +36,7 @@ void OptionManager::AddAllOptions() {
   AddGlobalPositionerOptions();
   AddBundleAdjusterOptions();
   AddTriangulatorOptions();
+  AddPosePriorOptions();
 }
 
 void OptionManager::AddDatabaseOptions() {
@@ -81,6 +82,11 @@ void OptionManager::AddGlobalMapperOptions() {
   AddAndRegisterDefaultOption("skip_retriangulation",
                               &mapper->skip_retriangulation);
   AddAndRegisterDefaultOption("skip_pruning", &mapper->skip_pruning);
+
+  // Whether to align the reconstruction to pose position priors after bundle
+  // adjustment (for metric scale) even if pose priors are not used as hard
+  // constraints.
+  AddAndRegisterDefaultOption("transform_to_meter", &mapper->transform_to_meter);
 }
 
 void OptionManager::AddGlobalMapperFullOptions() {
@@ -94,6 +100,7 @@ void OptionManager::AddGlobalMapperFullOptions() {
   AddBundleAdjusterOptions();
   AddTriangulatorOptions();
   AddInlierThresholdOptions();
+  AddPosePriorOptions();
 }
 
 void OptionManager::AddGlobalMapperResumeOptions() {
@@ -120,6 +127,11 @@ void OptionManager::AddGlobalMapperResumeOptions() {
   AddAndRegisterDefaultOption("skip_bundle_adjustment",
                               &mapper->skip_bundle_adjustment);
   AddAndRegisterDefaultOption("skip_pruning", &mapper->skip_pruning);
+
+  // Whether to align reconstruction to pose position priors after bundle
+  // adjustment (for metric scale) even if pose priors are not used as
+  // constraints.
+  AddAndRegisterDefaultOption("transform_to_meter", &mapper->transform_to_meter);
 }
 
 void OptionManager::AddGlobalMapperResumeFullOptions() {
@@ -129,6 +141,7 @@ void OptionManager::AddGlobalMapperResumeFullOptions() {
   AddBundleAdjusterOptions();
   AddTriangulatorOptions();
   AddInlierThresholdOptions();
+  AddPosePriorOptions();
 }
 
 void OptionManager::AddViewGraphCalibrationOptions() {
@@ -266,6 +279,39 @@ void OptionManager::AddInlierThresholdOptions() {
                               &mapper->inlier_thresholds.min_inlier_ratio);
   AddAndRegisterDefaultOption("Thresholds.max_rotation_error",
                               &mapper->inlier_thresholds.max_rotation_error);
+}
+
+void OptionManager::AddPosePriorOptions() {
+  if (added_pose_prior_options_) {
+    return;
+  }
+  added_pose_prior_options_ = true;
+  AddAndRegisterDefaultOption("PosePrior.use_pose_position_prior",
+                              &mapper->opt_pose_prior.use_pose_position_prior);
+  AddAndRegisterDefaultOption("PosePrior.prior_position_std_x",
+                              &mapper->opt_pose_prior.prior_position_std_x);
+  AddAndRegisterDefaultOption("PosePrior.prior_position_std_y",
+                              &mapper->opt_pose_prior.prior_position_std_y);
+  AddAndRegisterDefaultOption("PosePrior.prior_position_std_z",
+                              &mapper->opt_pose_prior.prior_position_std_z);
+  AddAndRegisterDefaultOption(
+      "PosePrior.overwrite_position_priors_covariance",
+      &mapper->opt_pose_prior.overwrite_position_priors_covariance);
+  AddAndRegisterDefaultOption(
+      "PosePrior.use_robust_loss_on_prior_position",
+      &mapper->opt_pose_prior.use_robust_loss_on_prior_position);
+  AddAndRegisterDefaultOption(
+      "PosePrior.prior_position_loss_threshold",
+      &mapper->opt_pose_prior.prior_position_loss_threshold);
+  AddAndRegisterDefaultOption(
+      "PosePrior.prior_position_scaled_loss_factor",
+      &mapper->opt_pose_prior.prior_position_scaled_loss_factor);
+  AddAndRegisterDefaultOption(
+      "PosePrior.first_iter_scaled_loss_divisor",
+      &mapper->opt_pose_prior.first_iter_scaled_loss_divisor);
+  AddAndRegisterDefaultOption(
+      "PosePrior.alignment_ransac_max_error",
+      &mapper->opt_pose_prior.alignment_ransac_max_error);
 }
 
 void OptionManager::AddGravityRefinerOptions() {
